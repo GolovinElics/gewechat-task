@@ -1,0 +1,8 @@
+{
+    "task_list_password": "你的密码",
+    "yuanfenju_api_key": "你的api_key(https://portal.yuanfenju.com/Merchant/Public/register?yf=22943)",
+    "admin_nickname": "管理员微信昵称",
+    "balance_threshold": 20,  // 余额阈值
+    "task_capacity": 100,
+    "time_adjust_interval": 1
+}
