@@ -15,7 +15,7 @@ import threading
 from datetime import datetime, timedelta
 from croniter import croniter  # 需要先 pip install croniter
 import sqlite3
-from typing import Optional
+from typing import Optional, Dict, Any
 from bridge.bridge import Bridge
 from channel.chat_message import ChatMessage
 from bridge.context import Context
@@ -218,20 +218,19 @@ class GeweChatTask(Plugin):
             if not base_url or not token or not self.app_id:
                 raise GeweChatTaskError("缺少必要的配置: gewechat_base_url, gewechat_token, gewechat_app_id")
             
-            self.client = GewechatClient(base_url, token)
             self.device_id = self._get_online_device_id()
             logger.info(f"[GeweChatTask] 使用设备 ID: {self.device_id}")
             
             # 1. 测试获取联系人列表
             try:
-                contacts_response = self.client.fetch_contacts_list(self.app_id)
+                contacts_response = self._fetch_contacts_list(self.app_id)
                 if contacts_response and contacts_response.get('ret') == 200:
                     logger.info("[GeweChatTask] 获取联系人列表测试成功")
                     # 如果获取联系人成功，使用第一个联系人作为测试对象
                     contacts = contacts_response.get('data', {}).get('friends', [])
                     if contacts:
                         test_wxid = contacts[0]
-                        response = self.client.post_text(
+                        response = self._post_text(
                             self.app_id,
                             test_wxid,
                             "GeweChatTask 插件初始化成功"
@@ -260,17 +259,12 @@ class GeweChatTask(Plugin):
                 return self.app_id
 
             # 如果 app_id 不在线，尝试获取设备列表
-            response = requests.post(
-                f"{conf().get('gewechat_base_url')}/personal/getSafetyInfo",
-                json={"appId": self.app_id},
-                headers={"X-GEWE-TOKEN": conf().get('gewechat_token')},
-                timeout=API_TIMEOUT
-            )
+            response = self._get_self_info(self.app_id)
             
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('ret') == 200 and data.get('data', {}).get('list'):
-                    devices = sorted(data['data']['list'], 
+            if response and response.get('ret') == 200:
+                data = response.get('data', {})
+                if data.get('list'):
+                    devices = sorted(data['list'], 
                                   key=lambda x: x.get('lastTime', 0), 
                                   reverse=True)
                     
@@ -297,26 +291,21 @@ class GeweChatTask(Plugin):
             if not device_id:
                 return False
 
-            response = requests.post(
-                f"{conf().get('gewechat_base_url')}/personal/getOnlineStatus",
-                json={
-                    "appId": self.app_id,
-                    "uuid": device_id
-                },
-                headers={"X-GEWE-TOKEN": conf().get('gewechat_token')},
-                timeout=API_TIMEOUT
-            )
+            data = {
+                "appId": self.app_id,
+                "uuid": device_id
+            }
+            response = self._make_request("POST", "personal/getSafetyInfo", data, timeout=API_TIMEOUT)
             
-            if response.status_code == 200:
-                data = response.json()
-                is_online = data.get('ret') == 200 and data.get('data', {}).get('online')
+            if response:
+                is_online = response.get('ret') == 200 and response.get('data', {}).get('online')
                 if is_online:
                     logger.debug(f"[GeweChatTask] 设备 {device_id} 在线")
                 else:
                     logger.debug(f"[GeweChatTask] 设备 {device_id} 离线")
                 return is_online
 
-            logger.debug(f"[GeweChatTask] 获取设备状态失败: HTTP {response.status_code}")
+            logger.info(f"[GeweChatTask] 获取设备状态失败: HTTP {response.status_code}")
             return False
             
         except Exception as e:
@@ -543,7 +532,7 @@ class GeweChatTask(Plugin):
                 return
                 
             # 获取所有群聊和联系人列表
-            response = self.client.fetch_contacts_list(self.app_id)
+            response = self._fetch_contacts_list(self.app_id)
             logger.debug(f"[GeweChatTask] fetch_contacts_list response: {response}")
 
             if response.get('ret') == 200:
@@ -566,10 +555,7 @@ class GeweChatTask(Plugin):
                 for chatroom_id in chatrooms:
                     try:
                         # 获取群信息
-                        group_info = self.client.get_chatroom_info(
-                            self.device_id,
-                            chatroom_id
-                        )
+                        group_info = self._get_chatroom_info(self.device_id, chatroom_id)
                         logger.debug(f"[GeweChatTask] Group info for {chatroom_id}: {group_info}")
                         
                         if group_info.get('ret') == 200:
@@ -640,21 +626,12 @@ class GeweChatTask(Plugin):
                 if friends:
                     try:
                         # 批量获取联系人信息
-                        friend_info_response = requests.post(
-                            f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                            json={
-                                "appId": conf().get('gewechat_app_id'),
-                                "wxids": friends
-                            },
-                            headers={
-                                "X-GEWE-TOKEN": conf().get('gewechat_token')
-                            }
-                        )
+                        friend_info_response = self._get_contact_brief_info(friends)
                         
-                        if friend_info_response.status_code == 200:
-                            data = friend_info_response.json()
-                            if data.get('ret') == 200 and data.get('data'):
-                                for contact in data['data']:
+                        if friend_info_response and friend_info_response.get('ret') == 200:
+                            data = friend_info_response.get('data', [])
+                            if isinstance(data, list):
+                                for contact in data:
                                     wxid = contact.get('userName')
                                     nickname = contact.get('nickName', '')
                                     if not nickname:
@@ -668,7 +645,7 @@ class GeweChatTask(Plugin):
                             else:
                                 logger.error(f"[GeweChatTask] Failed to get contacts info: {data}")
                         else:
-                            logger.error(f"[GeweChatTask] Failed to get contacts info, status: {friend_info_response.status_code}")
+                            logger.error(f"[GeweChatTask] Failed to get contacts info, status: {friend_info_response.get('ret')}")
                     except Exception as e:
                         logger.error(f"[GeweChatTask] Failed to update contacts: {e}")
                 
@@ -747,27 +724,220 @@ Cron表达式格式（高级）：
 
 注意：查看任务列表和删除所有任务都需要提供管理员密码，密码必须与配置文件中的task_list_password匹配。"""
 
-    def _get_user_nickname(self, user_id):
-        """获取用户昵称"""
+    def _get_contact_brief_info(self, wxids: list) -> Optional[Dict[str, Any]]:
+        """
+        获取联系人简要信息
+        
+        Args:
+            wxids: 微信ID列表,最多100个
+            
+        Returns:
+            Dict[str, Any]: 包含联系人信息的响应数据,失败返回None
+            
+        API文档:
+            - 请求方式: POST
+            - 接口: contacts/getBriefInfo
+            - 参数: 
+                - appId: 设备ID
+                - wxids: 好友的wxid列表
+        """
         try:
-            response = requests.post(
-                f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                json={
-                    "appId": conf().get('gewechat_app_id'),
-                    "wxids": [user_id]
-                },
-                headers={
-                    "X-GEWE-TOKEN": conf().get('gewechat_token')
-                }
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('ret') == 200 and data.get('data'):
-                    return data['data'][0].get('nickName', user_id)
+            if not wxids:
+                logger.error("[GeweChatTask] wxids不能为空")
+                return None
+                
+            if len(wxids) > 100:
+                logger.error("[GeweChatTask] wxids数量超过100个限制")
+                return None
+                
+            data = {
+                "appId": self.app_id,
+                "wxids": wxids
+            }
+            
+            response = self._make_request("POST", "contacts/getBriefInfo", data)
+            logger.debug(f"[GeweChatTask] getBriefInfo raw response: {response}")
+            
+            # 直接返回原始响应结构
+            return response
+            
+        except Exception as e:
+            logger.error(f"[GeweChatTask] 获取联系人简要信息失败: {e}")
+            return None
+
+    def _get_user_nickname(self, user_id: str) -> str:
+        """
+        获取用户昵称
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            str: 用户昵称，如果获取失败则返回用户ID
+        """
+        try:
+            response = self._get_contact_brief_info([user_id])
+            if response and response.get('ret') == 200:
+                data = response.get('data', [])
+                if isinstance(data, list) and len(data) > 0:
+                    return data[0].get('nickName', user_id)
             return user_id
         except Exception as e:
             logger.error(f"[GeweChatTask] 获取用户昵称失败: {e}")
             return user_id
+
+    def _set_user_nickname(self, chat_msg):
+        """
+        设置用户昵称
+        
+        Args:
+            chat_msg: 聊天消息对象
+        """
+        try:
+            response = self._get_contact_brief_info([chat_msg.from_user_id])
+            if response and response.get('ret') == 200:
+                data = response.get('data', [])
+                if isinstance(data, list) and len(data) > 0:
+                    chat_msg.other_user_nickname = data[0].get('nickName', chat_msg.from_user_id)
+                    chat_msg.actual_user_nickname = data[0].get('nickName', chat_msg.from_user_id)
+                else:
+                    chat_msg.other_user_nickname = chat_msg.from_user_id
+                    chat_msg.actual_user_nickname = chat_msg.from_user_id
+            else:
+                chat_msg.other_user_nickname = chat_msg.from_user_id
+                chat_msg.actual_user_nickname = chat_msg.from_user_id
+        except Exception as e:
+            logger.error(f"[GeweChatTask] 设置用户昵称失败: {e}")
+            chat_msg.other_user_nickname = chat_msg.from_user_id
+            chat_msg.actual_user_nickname = chat_msg.from_user_id
+
+    def _make_request(self, method: str, endpoint: str, data: Dict[str, Any] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
+        """
+        发送 HTTP 请求
+        
+        Args:
+            method: HTTP 方法 (GET, POST 等)
+            endpoint: API 端点
+            data: 请求数据
+            timeout: 超时时间(秒)
+            
+        Returns:
+            Dict[str, Any]: API 响应数据
+        """
+        try:
+            base_url = conf().get("gewechat_base_url").rstrip('/')
+            token = conf().get("gewechat_token")
+            headers = {
+                "X-GEWE-TOKEN": token,
+                "Content-Type": "application/json"
+            }
+            
+            # 移除endpoint开头和结尾的斜杠
+            endpoint = endpoint.strip('/')
+            
+            # 直接使用endpoint，不添加v2/api前缀
+            url = f"{base_url}/{endpoint}"
+                
+            logger.debug(f"[GeweChatTask] Making request to: {url}")
+            
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=data,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"API 请求失败: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"API 请求异常: {str(e)}")
+            return None
+
+    def _fetch_contacts_list(self, app_id: str) -> Dict[str, Any]:
+        """
+        获取联系人列表
+        
+        Args:
+            app_id: 应用 ID
+            
+        Returns:
+            Dict[str, Any]: 包含联系人列表的响应数据
+        """
+        data = {"appId": app_id}
+        response = self._make_request("POST", "contacts/fetchContactsList", data)
+        return response or {"ret": 500, "msg": "获取联系人列表失败"}
+    
+    def _fetch_contacts_list_cache(self, app_id: str) -> Dict[str, Any]:
+        """
+        获取联系人列表缓存
+        通讯录列表数据缓存10分钟，超时则需要重新调用获取通讯录列表接口
+        
+        Args:
+            app_id: 应用 ID
+            
+        Returns:
+            Dict[str, Any]: 包含联系人列表的响应数据
+        """
+        data = {"appId": app_id}
+        response = self._make_request("POST", "contacts/fetchContactsListCache", data)
+        return response or {"ret": 500, "msg": "获取联系人列表缓存失败"}
+
+    def _get_chatroom_info(self, device_id: str, chatroom_id: str) -> Dict[str, Any]:
+        """
+        获取群聊信息
+        
+        Args:
+            device_id: 设备 ID
+            chatroom_id: 群聊 ID
+            
+        Returns:
+            Dict[str, Any]: 包含群聊信息的响应数据
+        """
+        data = {
+            "appId": device_id,
+            "chatroomId": chatroom_id
+        }
+        response = self._make_request("POST", "group/getChatroomInfo", data)
+        return response or {"ret": 500, "msg": "获取群聊信息失败"}
+
+    def _post_text(self, app_id: str, to_wxid: str, content: str) -> Dict[str, Any]:
+        """
+        发送文本消息
+        
+        Args:
+            app_id: 应用 ID
+            to_wxid: 接收者 ID
+            content: 消息内容
+            
+        Returns:
+            Dict[str, Any]: API 响应数据
+        """
+        data = {
+            "appId": app_id,
+            "toWxid": to_wxid,
+            "content": content
+        }
+        response = self._make_request("POST", "message/postText", data)
+        return response or {"ret": 500, "msg": "发送消息失败"}
+
+    def _get_self_info(self, app_id: str) -> Dict[str, Any]:
+        """
+        获取个人资料信息
+        
+        Args:
+            app_id: 应用 ID
+            
+        Returns:
+            Dict[str, Any]: 包含个人资料的响应数据
+        """
+        data = {"appId": app_id}
+        response = self._make_request("POST", "personal/getProfile", data)
+        return response or {"ret": 500, "msg": "获取个人资料失败"}
 
     def _get_task_list(self):
         """获取任务列表"""
@@ -1021,82 +1191,50 @@ Cron表达式格式（高级）：
                 return result
 
     def _get_contacts(self):
-        """获取联系人列表，优先使用缓存"""
-        current_time = int(time.time())
-        
-        # 检查缓存是否有效
-        if (current_time - self.contacts_cache["last_update"]) < CONTACTS_CACHE_TIMEOUT:
-            logger.debug("[GeweChatTask] 使用缓存的联系人列表")
-            return self.contacts_cache["contacts"]
-        
+        """获取联系人列表,增加重试和缓存机制"""
         try:
-            # 设置请求超时
-            timeout = 5  # 缩短超时时间到5秒
-            
-            # 先尝试从缓存接口获取
-            try:
-                response = requests.post(
-                    f"{conf().get('gewechat_base_url')}/contacts/fetchContactsListCache",
-                    json={"appId": conf().get('gewechat_app_id')},
-                    headers={"X-GEWE-TOKEN": conf().get('gewechat_token')},
-                    timeout=timeout
-                )
+            # 1. 先尝试获取缓存的联系人列表
+            cache_response = self._fetch_contacts_list_cache(self.app_id)
+            if cache_response and cache_response.get('ret') == 200:
+                logger.info("[GeweChatTask] 成功获取联系人列表缓存")
+                return cache_response.get('data', {}).get('friends', [])
+
+            # 2. 如果缓存失效,重新获取完整列表
+            response = self._fetch_contacts_list(self.app_id)
+            if response and response.get('ret') == 200:
+                logger.info("[GeweChatTask] 成功获取完整联系人列表")
+                return response.get('data', {}).get('friends', [])
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    logger.debug(f"[GeweChatTask] 缓存联系人列表响应: {data}")
-                    if data.get('ret') == 200 and data.get('data', {}).get('friends'):
-                        contacts = data['data']['friends']
-                        self.contacts_cache = {
-                            "last_update": current_time,
-                            "contacts": contacts
-                        }
-                        return contacts
-            except requests.Timeout:
-                logger.debug("[GeweChatTask] 获取缓存联系人列表超时")
-            except Exception as e:
-                logger.debug(f"[GeweChatTask] 获取缓存联系人列表失败: {e}")
-            
-            # 如果缓存接口失败或返回空，尝试实时获取
-            logger.debug("[GeweChatTask] 尝试实时获取联系人列表")
-            try:
-                response = requests.post(
-                    f"{conf().get('gewechat_base_url')}/contacts/fetchContactsList",
-                    json={"appId": conf().get('gewechat_app_id')},
-                    headers={"X-GEWE-TOKEN": conf().get('gewechat_token')},
-                    timeout=timeout
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    logger.debug(f"[GeweChatTask] 实时联系人列表响应: {data}")
-                    if data.get('ret') == 200 and data.get('data', {}).get('friends'):
-                        contacts = data['data']['friends']
-                        self.contacts_cache = {
-                            "last_update": current_time,
-                            "contacts": contacts
-                        }
-                        return contacts
-            except requests.Timeout:
-                logger.debug("[GeweChatTask] 获取实时联系人列表超时")
-            except Exception as e:
-                logger.debug(f"[GeweChatTask] 获取实时联系人列表失败: {e}")
-            
-            # 如果实时获取也失败，使用缓存（即使已过期）
-            if self.contacts_cache["contacts"]:
-                logger.debug("[GeweChatTask] 使用过期的联系人缓存")
-                return self.contacts_cache["contacts"]
-            
-            logger.debug("[GeweChatTask] 获取联系人列表失败（缓存和实时都失败）")
+            logger.error(f"[GeweChatTask] 获取联系人列表失败: {response}")
             return []
-            
         except Exception as e:
-            logger.debug(f"[GeweChatTask] 获取联系人列表异常: {e}")
-            # 发生异常时也尝试使用缓存
-            if self.contacts_cache["contacts"]:
-                logger.debug("[GeweChatTask] 发生异常，使用缓存的联系人列表")
-                return self.contacts_cache["contacts"]
+            logger.error(f"[GeweChatTask] 获取联系人列表异常: {e}")
             return []
+
+    def _search_contact(self, user_name: str) -> Optional[str]:
+        """搜索联系人
+        Args:
+            user_name: 用户名/昵称
+        Returns:
+            Optional[str]: 找到的用户wxid,未找到返回None
+        """
+        try:
+            # 构造搜索请求
+            data = {
+                "appId": self.app_id,
+                "contactsInfo": user_name
+            }
+            response = self._make_request("POST", "contacts/search", data)
+            
+            if response and response.get('ret') == 200:
+                search_result = response.get('data', {})
+                if search_result:
+                    logger.info(f"[GeweChatTask] 搜索到用户: {user_name} -> {search_result.get('v3')}")
+                    return search_result.get('v3')
+            return None
+        except Exception as e:
+            logger.error(f"[GeweChatTask] 搜索用户失败: {e}")
+            return None
 
     def _create_task(self, time_str, circle_str, event_str, context):
         """创建任务"""
@@ -1187,17 +1325,8 @@ Cron表达式格式（高级）：
                 target_user = context.get('user_mention')
                 # 验证用户是否存在
                 try:
-                    response = requests.post(
-                        f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                        json={
-                            "appId": conf().get('gewechat_app_id'),
-                            "wxids": [target_user]
-                        },
-                        headers={
-                            "X-GEWE-TOKEN": conf().get('gewechat_token')
-                        }
-                    )
-                    if response.status_code != 200 or response.json().get('ret') != 200:
+                    response = self._get_contact_brief_info([target_user])
+                    if response.get('ret') != 200 or not response.get('data'):
                         return f"无法验证用户信息，请确保用户存在"
                 except Exception as e:
                     logger.error(f"[GeweChatTask] 验证用户信息失败: {e}")
@@ -1308,29 +1437,33 @@ Cron表达式格式（高级）：
                 user_name = task_id_or_target[2:-1]
                 logger.info(f"[GeweChatTask] 开始查找用户 {user_name} 的任务")
 
-                # 先获取用户的wxid
+                # 1. 先从联系人列表查找
                 contacts = self._get_contacts()
                 target_wxid = None
-
+                
+                logger.info(f"[GeweChatTask] 获取到联系人列表: {len(contacts) if contacts else 0} 个联系人")
+                
                 if contacts:
                     # 获取每个联系人的详细信息
                     for wxid in contacts:
                         try:
-                            response = requests.post(
-                                f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                                json={
-                                    "appId": conf().get('gewechat_app_id'),
-                                    "wxids": [wxid]
-                                },
-                                headers={
-                                    "X-GEWE-TOKEN": conf().get('gewechat_token')
-                                }
-                            )
-                            if response.status_code == 200:
-                                data = response.json()
-                                if data.get('ret') == 200 and data.get('data'):
-                                    contact_info = data['data'][0]
-                                    if contact_info.get('nickName') == user_name:
+                            # 跳过系统内置联系人
+                            if wxid in ['fmessage', 'medianote', 'floatbottle', 'weixin']:
+                                continue
+                                
+                            logger.info(f"[GeweChatTask] 正在检查联系人: {wxid}")
+                            response = self._get_contact_brief_info([wxid])
+                            
+                            if response and response.get('ret') == 200:
+                                data = response.get('data', [])
+                                if isinstance(data, list) and len(data) > 0:
+                                    contact_info = data[0]
+                                    logger.info(f"[GeweChatTask] 联系人详情: "
+                                              f"wxid={wxid}, "
+                                              f"昵称={contact_info.get('nickName')}, "
+                                              f"备注={contact_info.get('remark')}")
+                                    
+                                    if contact_info.get('nickName', '').strip() == user_name.strip():
                                         target_wxid = wxid
                                         logger.info(f"[GeweChatTask] 找到目标用户: {user_name} -> {target_wxid}")
                                         break
@@ -1338,51 +1471,78 @@ Cron表达式格式（高级）：
                             logger.error(f"[GeweChatTask] 获取用户详情失败: {e}")
                             continue
 
+                # 2. 如果联系人列表中未找到,尝试搜索
+                if not target_wxid:
+                    logger.info(f"[GeweChatTask] 联系人列表未找到用户,尝试搜索: {user_name}")
+                    target_wxid = self._search_contact(user_name)
+
                 if target_wxid:
-                    # 使用wxid查找任务，只查找用户自己创建的任务或明确提到该用户的任务
+                    # 修改查询语句，只查找指定用户作为执行对象的任务
                     query = '''
                         SELECT t.id, t.time, t.circle, t.event, t.context
                         FROM tasks t
                         WHERE (
+                            -- 用户是发送者
                             json_extract(t.context, '$.msg.from_user_id') = ?
-                            AND json_extract(t.context, '$.msg.actual_user_id') = ?
+                            -- 或者内容中包含用户标记
+                            OR json_extract(t.context, '$.content') LIKE ?
                         )
-                        OR json_extract(t.context, '$.user_mention') = ?
                     '''
-                    logger.info(f"[GeweChatTask] 执行查询: {query} 参数: {target_wxid}")
+                    query_params = (
+                        target_wxid,                # from_user_id
+                        f"%u[{user_name}]%"        # content LIKE
+                    )
+                    
+                    logger.info(f"[GeweChatTask] 执行查询: {query}")
+                    logger.info(f"[GeweChatTask] 查询参数: {query_params}")
 
-                    cursor.execute(query, (target_wxid, target_wxid, target_wxid))
-                    tasks = cursor.fetchall()
+                    try:
+                        cursor.execute(query, query_params)
+                        tasks = cursor.fetchall()
 
-                    # 打印找到的任务详情
-                    logger.info(f"[GeweChatTask] 找到 {len(tasks) if tasks else 0} 个任务")
-                    for task in tasks:
-                        try:
-                            context = json.loads(task[4])  # 解析context字段
-                            logger.info(f"[GeweChatTask] 任务详情: ID={task[0]}, 时间={task[1]}, "
-                                      f"周期={task[2]}, 事件={task[3]}, "
-                                      f"from_user_id={context.get('msg', {}).get('from_user_id')}, "
-                                      f"user_mention={context.get('msg', {}).get('user_mention')}, "
-                                      f"actual_user_id={context.get('msg', {}).get('actual_user_id')}, "
-                                      f"isgroup={context.get('isgroup')}")
-                        except Exception as e:
-                            logger.error(f"[GeweChatTask] 解析任务详情失败: {e}")
+                        # 打印找到的任务详情
+                        logger.info(f"[GeweChatTask] 找到 {len(tasks) if tasks else 0} 个任务")
+                        for task in tasks:
+                            try:
+                                context = json.loads(task[4])
+                                logger.info(f"[GeweChatTask] 任务详情: \n"
+                                          f"ID={task[0]}\n"
+                                          f"时间={task[1]}\n"
+                                          f"周期={task[2]}\n"
+                                          f"事件={task[3]}\n"
+                                          f"上下文={json.dumps(context, ensure_ascii=False, indent=2)}")
+                            except Exception as e:
+                                logger.error(f"[GeweChatTask] 解析任务详情失败: {e}")
 
-                    if tasks:
-                        # 删除找到的任务
-                        task_ids = [task[0] for task in tasks]
-                        delete_query = 'DELETE FROM tasks WHERE id IN ({})'.format(
-                            ','.join(['?'] * len(task_ids))
-                        )
-                        logger.info(f"[GeweChatTask] 执行删除: {delete_query} 参数: {task_ids}")
-                        cursor.execute(delete_query, task_ids)
-                        deleted_tasks = tasks
-                    else:
-                        logger.info(f"[GeweChatTask] 未找到用户 {user_name} 的任务")
-                        return f"未找到用户 {user_name} 的任务"
+                        if tasks:
+                            # 删除找到的任务
+                            task_ids = [task[0] for task in tasks]
+                            delete_query = 'DELETE FROM tasks WHERE id IN ({})'.format(
+                                ','.join(['?'] * len(task_ids))
+                            )
+                            logger.info(f"[GeweChatTask] 执行删除: {delete_query} 参数: {task_ids}")
+                            
+                            try:
+                                cursor.execute(delete_query, task_ids)
+                                conn.commit()  # 确保提交事务
+                                logger.info(f"[GeweChatTask] 成功删除 {len(task_ids)} 个任务")
+                                return f"已删除 {len(task_ids)} 个任务"
+                            except Exception as e:
+                                conn.rollback()  # 发生错误时回滚
+                                logger.error(f"[GeweChatTask] 删除任务失败: {e}")
+                                return f"删除任务失败: {str(e)}"
+                        else:
+                            logger.info(f"[GeweChatTask] 未找到用户 {user_name} 的任务")
+                            return f"未找到用户 {user_name} 的任务"
+
+                    except Exception as e:
+                        conn.rollback()  # 发生错误时回滚
+                        logger.error(f"[GeweChatTask] 查询任务失败: {e}")
+                        return f"查询任务失败: {str(e)}"
                 else:
-                    logger.info(f"[GeweChatTask] 未找到用户: {user_name}")
-                    return f"未找到用户: {user_name}"
+                    error_msg = f"未找到用户: {user_name} (已尝试联系人列表和搜索)"
+                    logger.info(f"[GeweChatTask] {error_msg}")
+                    return error_msg
 
             elif task_id_or_target.startswith("g[") and task_id_or_target.endswith("]"):
                 # 删除指定群聊的任务
@@ -1580,7 +1740,6 @@ Cron表达式格式（高级）：
                         raise ValueError("获取老黄历信息失败")
 
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         result
@@ -1596,7 +1755,6 @@ Cron表达式格式（高级）：
                         raise ValueError("获取星座运势失败")
 
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         result
@@ -1614,7 +1772,6 @@ Cron表达式格式（高级）：
 
                     # 发送消息
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         message
@@ -1623,20 +1780,66 @@ Cron表达式格式（高级）：
                 else:
                     error_msg = f"⚠️ 插件执行失败\n{'='*22}\n不支持的插件类型: {plugin_name}\n支持的插件类型:\n- 老黄历\n- 星座-xx座（如：星座-白羊座）\n- 余额查询"
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         error_msg
                     ):
                         logger.error(f"[GeweChatTask] 发送错误提示失败: {error_msg}")
                     raise ValueError(f"不支持的插件类型: {plugin_name}")
-            elif content.startswith('提醒'):
-                # 提醒消息
-                self._handle_reminder_task(task_id, content, msg_info)
             else:
-                # 其他所有消息都交给系统其他插件处理
-                self._create_and_send_chat_message(content, msg_info, is_group)
-                logger.info(f"[GeweChatTask] 已转发消息到插件处理: {task_id}")
+                # 检查是否包含用户或群组标记，并提取实际内容
+                actual_content = content
+                target_wxid = msg_info.get('from_user_id')  # 默认发送者
+                user_match = re.search(r'u\[([^\]]+)\]\s*(.*)', content)
+                group_match = re.search(r'g\[([^\]]+)\]\s*(.*)', content)
+                
+                if user_match or group_match:
+                    # 提取目标用户/群组和实际内容
+                    if user_match:
+                        target_name = user_match.group(1)
+                        actual_content = user_match.group(2)
+                        # 获取用户wxid
+                        logger.info(f"[GeweChatTask] 尝试获取用户wxid，昵称: {target_name}")
+                        target_wxid = self._get_user_by_nickname(target_name)
+                        logger.info(f"[GeweChatTask] 获取用户wxid结果: {target_wxid}")
+                        if not target_wxid:
+                            raise ValueError(f"未找到用户: {target_name}")
+                        logger.info(f"[GeweChatTask] 找到用户: {target_name} -> {target_wxid}")
+                    else:
+                        target_name = group_match.group(1)
+                        actual_content = group_match.group(2)
+                        # 获取群组wxid
+                        logger.info(f"[GeweChatTask] 尝试获取群组wxid，群名: {target_name}")
+                        conn = self._get_db_connection()
+                        try:
+                            cursor = conn.cursor()
+                            cursor.execute('SELECT wxid FROM groups WHERE nickname = ?', (target_name,))
+                            result = cursor.fetchone()
+                            if result:
+                                target_wxid = result[0]
+                                logger.info(f"[GeweChatTask] 找到群组: {target_name} -> {target_wxid}")
+                            else:
+                                raise ValueError(f"未找到群组: {target_name}")
+                        finally:
+                            self._return_db_connection(conn)
+                    
+                    # 更新msg_info中的接收者信息
+                    if isinstance(msg_info, dict):
+                        msg_info['to_user_id'] = target_wxid
+                        msg_info['content'] = actual_content
+                
+                # 去除所有前导和尾随空格
+                actual_content = actual_content.strip()
+                logger.info(f"[GeweChatTask] 处理后的内容: {actual_content}, 目标接收者: {target_wxid}")
+                
+                if actual_content.startswith('提醒'):
+                    # 使用更新后的msg_info（包含正确的接收者信息）
+                    self._handle_reminder_task(task_id, actual_content, msg_info)
+                else:
+                    # 其他消息交给系统其他插件处理，使用更新后的msg_info
+                    msg_info['from_user_id'] = target_wxid  # 更新接收者信息
+                    self._create_and_send_chat_message(actual_content, msg_info, is_group)
+                    logger.info(f"[GeweChatTask] 已转发消息到插件处理: {task_id}")
             
             logger.info(f"[GeweChatTask] 任务执行完成: {task_id}")
 
@@ -1679,8 +1882,8 @@ Cron表达式格式（高级）：
         """处理提醒任务"""
         try:
             with self._message_lock:
-                # 验证接收者ID
-                to_wxid = msg_info.get('from_user_id')
+                # 优先使用指定的接收者ID，如果没有则使用发送者ID
+                to_wxid = msg_info.get('to_user_id') or msg_info.get('from_user_id')
                 if not to_wxid:
                     raise ValueError("无法获取接收者ID")
                 
@@ -1689,11 +1892,13 @@ Cron表达式格式（高级）：
                 if not reminder_content:
                     raise ValueError("提醒内容不能为空")
                     
+                # 记录日志
+                logger.info(f"[GeweChatTask] 处理提醒任务: {task_id}, 内容: {reminder_content}, 接收者: {to_wxid}")
+                    
                 reminder_message = f"⏰ 定时提醒\n{'-' * 20}\n{reminder_content}\n{'-' * 20}\n发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 # 使用重试机制发送消息
                 if not self._send_message_with_retry(
-                    self.client,
                     self.app_id,
                     to_wxid,
                     reminder_message
@@ -1723,7 +1928,6 @@ Cron表达式格式（高级）：
                         raise ValueError("获取老黄历信息失败")
                         
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         result
@@ -1739,7 +1943,6 @@ Cron表达式格式（高级）：
                         raise ValueError("获取星座运势失败")
                         
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         result
@@ -1757,7 +1960,6 @@ Cron表达式格式（高级）：
                     
                     # 发送消息
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         message
@@ -1766,7 +1968,6 @@ Cron表达式格式（高级）：
                 else:
                     error_msg = f"⚠️ 插件执行失败\n{'='*22}\n不支持的插件类型: {plugin_name}\n支持的插件类型:\n- 老黄历\n- 星座-xx座（如：星座-白羊座）\n- 余额查询"
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         error_msg
@@ -1778,7 +1979,6 @@ Cron表达式格式（高级）：
             # 发送错误提示给用户
             error_msg = f"⚠️ 插件执行失败\n{'='*22}\n{str(e)}"
             if not self._send_message_with_retry(
-                self.client,
                 self.app_id,
                 to_wxid,
                 error_msg
@@ -1837,7 +2037,6 @@ Cron表达式格式（高级）：
                 # 如果没有插件处理，则直接发送原始消息
                 if e_context.action == EventAction.CONTINUE:
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         content
@@ -1850,11 +2049,10 @@ Cron表达式格式（高级）：
             logger.error(f"[GeweChatTask] 发送普通消息失败: {e}")
             raise
 
-    def _send_message_with_retry(self, client, app_id: str, to_wxid: str, content: str, max_retries: int = MAX_RETRIES) -> bool:
+    def _send_message_with_retry(self, app_id: str, to_wxid: str, content: str, max_retries: int = MAX_RETRIES) -> bool:
         """带重试机制的消息发送
 
         Args:
-            client: GewechatClient实例
             app_id: 应用ID
             to_wxid: 接收者ID
             content: 消息内容
@@ -1868,13 +2066,13 @@ Cron表达式格式（高级）：
         
         while retry_count < max_retries:
             try:
-                response = client.post_text(app_id, to_wxid, content)
+                response = self._post_text(app_id, to_wxid, content)
                 if response and response.get('ret') == 200:
                     logger.info(f"[GeweChatTask] 消息发送成功: {to_wxid}")
                     return True
                 else:
                     logger.warning(f"[GeweChatTask] 发送消息失败，状态码: {response.get('ret')}, 响应: {response}")
-                
+            
             except Exception as e:
                 logger.error(f"[GeweChatTask] 发送消息异常: {str(e)}, 重试中...")
             
@@ -1943,7 +2141,7 @@ Cron表达式格式（高级）：
                 chat_msg.actual_user_nickname = chat_msg.from_user_id
                 return
                 
-            group_info = self.client.get_chatroom_info(self.device_id, chat_msg.from_user_id)
+            group_info = self._get_chatroom_info(self.device_id, chat_msg.from_user_id)
             if group_info.get('ret') == 200:
                 data = group_info.get('data', {})
                 chat_msg.other_user_nickname = data.get('nickName', chat_msg.from_user_id)
@@ -1961,21 +2159,12 @@ Cron表达式格式（高级）：
     def _set_user_nickname(self, chat_msg):
         """设置用户昵称"""
         try:
-            response = requests.post(
-                f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                json={
-                    "appId": conf().get('gewechat_app_id'),
-                    "wxids": [chat_msg.from_user_id]
-                },
-                headers={
-                    "X-GEWE-TOKEN": conf().get('gewechat_token')
-                }
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('ret') == 200 and data.get('data'):
-                    chat_msg.other_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
-                    chat_msg.actual_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
+            response = self._get_contact_brief_info([chat_msg.from_user_id])
+            if response and response.get('ret') == 200:
+                data = response.get('data', [])
+                if isinstance(data, list) and len(data) > 0:
+                    chat_msg.other_user_nickname = data[0].get('nickName', chat_msg.from_user_id)
+                    chat_msg.actual_user_nickname = data[0].get('nickName', chat_msg.from_user_id)
                 else:
                     chat_msg.other_user_nickname = chat_msg.from_user_id
                     chat_msg.actual_user_nickname = chat_msg.from_user_id
@@ -1983,9 +2172,51 @@ Cron表达式格式（高级）：
                 chat_msg.other_user_nickname = chat_msg.from_user_id
                 chat_msg.actual_user_nickname = chat_msg.from_user_id
         except Exception as e:
-            logger.error(f"[GeweChatTask] 获取用户昵称失败: {e}")
+            logger.error(f"[GeweChatTask] 设置用户昵称失败: {e}")
             chat_msg.other_user_nickname = chat_msg.from_user_id
             chat_msg.actual_user_nickname = chat_msg.from_user_id
+
+    def _get_user_by_nickname(self, nickname: str) -> Optional[str]:
+        """
+        根据昵称获取用户wxid
+        
+        Args:
+            nickname: 用户昵称
+            
+        Returns:
+            Optional[str]: 用户wxid，如果未找到则返回None
+        """
+        try:
+            # 获取联系人列表
+            response = self._fetch_contacts_list(self.app_id)
+            if response.get('ret') != 200 or not response.get('data', {}).get('friends'):
+                return None
+                
+            contacts = response['data']['friends']
+            
+            for wxid in contacts:
+                try:
+                    # 跳过系统内置联系人
+                    if wxid in ['fmessage', 'medianote', 'floatbottle', 'weixin']:
+                        continue
+                        
+                    # 获取联系人信息（直接使用data字段）
+                    response = self._get_contact_brief_info([wxid])
+                    if response and response.get('ret') == 200:
+                        contact_list = response.get('data', [])  # 直接获取data列表
+                        if isinstance(contact_list, list) and len(contact_list) > 0:
+                            contact_info = contact_list[0]  # 直接取第一个元素
+                            current_nickname = contact_info.get('nickName', '')
+                            if current_nickname.strip() == nickname.strip():
+                                return wxid
+                except Exception as e:
+                    logger.debug(f"[GeweChatTask] 查询用户信息异常: {e}")
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"[GeweChatTask] 根据昵称获取用户失败: {e}")
+            return None
 
     def _build_context(self, content, msg_info, chat_msg, is_group):
         """构建Context对象"""
@@ -2020,7 +2251,6 @@ Cron表达式格式（高级）：
                     
                     # 直接发送消息
                     if not self._send_message_with_retry(
-                        self.client,
                         self.app_id,
                         to_wxid,
                         content
@@ -2153,35 +2383,27 @@ Cron表达式格式（高级）：
                         
                         # 获取联系人列表并查找目标用户
                         contacts = self._get_contacts()
-                        target_user = None
+                        target_wxid = None  # 修改变量名保持一致
                         
                         if contacts:
                             # 获取每个联系人的详细信息
                             for wxid in contacts:
                                 try:
-                                    response = requests.post(
-                                        f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                                        json={
-                                            "appId": conf().get('gewechat_app_id'),
-                                            "wxids": [wxid]
-                                        },
-                                        headers={
-                                            "X-GEWE-TOKEN": conf().get('gewechat_token')
-                                        }
-                                    )
-                                    if response.status_code == 200:
-                                        data = response.json()
-                                        if data.get('ret') == 200 and data.get('data'):
-                                            contact_info = data['data'][0]
+                                    response = self._get_contact_brief_info([wxid])
+                                    
+                                    if response and response.get('ret') == 200:
+                                        data = response.get('data', [])
+                                        if isinstance(data, list) and len(data) > 0:
+                                            contact_info = data[0]  # 直接取第一个元素
                                             if contact_info.get('nickName') == user_name:
-                                                target_user = wxid
-                                                logger.info(f"[GeweChatTask] 找到目标用户: {user_name} -> {target_user}")
+                                                target_wxid = wxid
+                                                logger.info(f"[GeweChatTask] 找到目标用户: {user_name} -> {target_wxid}")
                                                 break
                                 except Exception as e:
-                                    logger.error(f"[GeweChatTask] 获取用户详情失败: {e}")
+                                    logger.error(f"[GeweChatTask] 获取用户详情失败: {e}, 响应内容: {response}")
                                     continue
                             
-                            if not target_user:
+                            if not target_wxid:  # 修改判断条件
                                 e_context['reply'] = Reply(ReplyType.ERROR, f"未找到用户: {user_name}，请确保昵称完全匹配")
                                 e_context.action = EventAction.BREAK_PASS
                                 return
@@ -2191,7 +2413,7 @@ Cron表达式格式（高级）：
                             return
                         
                         # 修改上下文信息，添加用户标记
-                        e_context['context']['user_mention'] = target_user
+                        e_context['context']['user_mention'] = target_wxid  # 使用 target_wxid
                 
                 result = self._create_task(time_str, circle_str, event_str, e_context['context'])
                 e_context['reply'] = Reply(ReplyType.TEXT, result)
@@ -2430,21 +2652,11 @@ Cron表达式格式（高级）：
                 if self.contacts_cache["contacts"]:
                     for wxid in self.contacts_cache["contacts"]:
                         try:
-                            response = requests.post(
-                                f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                                json={
-                                    "appId": conf().get('gewechat_app_id'),
-                                    "wxids": [wxid]
-                                },
-                                headers={
-                                    "X-GEWE-TOKEN": conf().get('gewechat_token')
-                                },
-                                timeout=3  # 缩短超时时间到3秒
-                            )
-                            if response.status_code == 200:
-                                data = response.json()
-                                if data.get('ret') == 200 and data.get('data'):
-                                    if data['data'][0].get('nickName') == admin_nickname:
+                            response = self._get_contact_brief_info([wxid])
+                            if response and response.get('ret') == 200:
+                                data = response.get('data', [])
+                                if isinstance(data, list) and len(data) > 0:
+                                    if data[0].get('nickName') == admin_nickname:
                                         admin_wxid = wxid
                                         break
                         except Exception as e:
@@ -2457,21 +2669,11 @@ Cron表达式格式（高级）：
                     if contacts:
                         for wxid in contacts:
                             try:
-                                response = requests.post(
-                                    f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                                    json={
-                                        "appId": conf().get('gewechat_app_id'),
-                                        "wxids": [wxid]
-                                    },
-                                    headers={
-                                        "X-GEWE-TOKEN": conf().get('gewechat_token')
-                                    },
-                                    timeout=3  # 缩短超时时间到3秒
-                                )
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    if data.get('ret') == 200 and data.get('data'):
-                                        if data['data'][0].get('nickName') == admin_nickname:
+                                response = self._get_contact_brief_info([wxid])
+                                if response and response.get('ret') == 200:
+                                    data = response.get('data', [])
+                                    if isinstance(data, list) and len(data) > 0:
+                                        if data[0].get('nickName') == admin_nickname:
                                             admin_wxid = wxid
                                             break
                             except Exception as e:
@@ -2498,7 +2700,6 @@ Cron表达式格式（高级）：
                     message = f"⚠️ API余额不足提醒\n{'='*22}\n当前剩余调用次数：{remaining_times}\n阈值设置：{balance_threshold}\n请及时充值以确保服务正常运行。"
                     
                     if not self._send_message_with_retry(
-                        client,
                         conf().get("gewechat_app_id"),
                         admin_wxid,
                         message
