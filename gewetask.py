@@ -96,8 +96,10 @@ class GeweChatTask(Plugin):
         except Exception as e:
             logger.error(f"[GeweChatTask] 清理缓存失败: {e}")
 
-        super(Plugin, self).__init__()  # 修改这里，明确指定父类
-        self.command_prefix = "$time"  # 添加命令前缀
+        super(Plugin, self).__init__()          # 修改这里，明确指定父类
+        self.command_prefix = "$time"           # 添加命令前缀
+        self.command_prefix_second = "/time"    # 添加命令前缀
+        self.command_prefix_third = "/任务"     # 添加命令前缀
         self._instance = None
         self._initialized = False
         self._scheduler = None
@@ -666,7 +668,7 @@ class GeweChatTask(Plugin):
 
     def get_help_text(self, **kwargs):
         return f"""定时任务插件使用说明:
-命令前缀: {self.command_prefix}
+命令前缀: {self.command_prefix} (也可使用 {self.command_prefix_second} 或 {self.command_prefix_third})
 
 1. 创建定时任务
 基础格式：
@@ -2279,151 +2281,159 @@ Cron表达式格式（高级）：
         
         # 处理命令
         logger.debug(f"[GeweChatTask] 收到命令: {content}")
+        
+        # 添加对 /time 和 $time 及 /任务 三类指令命令的处理
         if content.startswith(self.command_prefix):
             command = content[len(self.command_prefix):].strip()
-            
-            # 空命令显示帮助
-            if not command:
-                e_context['reply'] = Reply(ReplyType.TEXT, self.get_help_text())
-                e_context.action = EventAction.BREAK_PASS
-                return
-            
-            # 插件直接调用机制 - 检查是否是直接的插件调用
-            plugin_match = re.match(r'^p\[([^\]]+)\]', command)
-            if plugin_match:
-                plugin_name = plugin_match.group(1)
-                # 创建一个当前时间的任务
-                now = datetime.now()
-                time_str = now.strftime("%H:%M")
-                circle_str = "今天"
-                
-                # 构建任务内容
-                event_str = command  # 使用完整的命令作为事件内容
-                
-                # 创建并执行任务
-                result = self._create_task(time_str, circle_str, event_str, e_context['context'])
-                e_context['reply'] = Reply(ReplyType.TEXT, result)
-                e_context.action = EventAction.BREAK_PASS
-                return
-            
-            # 1. 先处理特殊命令（任务列表和取消任务）
-            if command.startswith("任务列表"):
-                # 检查是否提供了密码
-                parts = command.split()
-                if len(parts) < 2:
-                    e_context['reply'] = Reply(ReplyType.ERROR, "请提供访问密码")
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                
-                # 验证密码
-                password = parts[1]
-                config_password = self.plugin_config.get('task_list_password')
-                if not config_password:
-                    e_context['reply'] = Reply(ReplyType.ERROR, "管理员未设置访问密码，无法查看任务列表")
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                
-                if password != config_password:
-                    e_context['reply'] = Reply(ReplyType.ERROR, "访问密码错误")
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                
-                # 密码正确，显示任务列表
-                task_list = self._get_task_list()
-                e_context['reply'] = Reply(ReplyType.TEXT, task_list)
-                e_context.action = EventAction.BREAK_PASS
-                return
-            
-            # 取消任务
-            if command.startswith("取消"):
-                # 移除"取消"并清理空格
-                target = command[2:].strip()
-                if not target:
-                    e_context['reply'] = Reply(ReplyType.ERROR, "请指定要取消的任务ID、用户、群聊或 all")
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-
-                result = self._delete_task(target)
-                e_context['reply'] = Reply(ReplyType.TEXT, result)
-                e_context.action = EventAction.BREAK_PASS
-                return
-            
-            # 2. 处理 cron 表达式命令
-            if "cron[" in command:
-                # 使用正则表达式匹配 cron 表达式和事件内容
-                match = re.match(r'cron\[(.*?)\]\s*(.*)', command)
-                if match:
-                    cron_exp = match.group(1).strip()
-                    event_str = match.group(2).strip()
-                    if not event_str:
-                        e_context['reply'] = Reply(ReplyType.ERROR, "请输入事件内容")
-                        e_context.action = EventAction.BREAK_PASS
-                        return
-                    result = self._create_task("cron", f"cron[{cron_exp}]", event_str, e_context['context'])
-                    e_context['reply'] = Reply(ReplyType.TEXT, result)
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                else:
-                    e_context['reply'] = Reply(ReplyType.ERROR, "cron表达式格式错误，正确格式：$time cron[分 时 日 月 周] 事件内容")
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-            
-            # 3. 处理普通定时任务
-            parts = command.split(" ", 2)
-            if len(parts) == 3:
-                circle_str, time_str, event_str = parts
-                
-                # 检查是否包含用户标记
-                user_name = None
-                if 'u[' in event_str:
-                    match = re.match(r'u\[([^\]]+)\]\s*(.*)', event_str)
-                    if match:
-                        user_name = match.group(1)
-                        event_str = match.group(2).strip()
-                        
-                        # 获取联系人列表并查找目标用户
-                        contacts = self._get_contacts()
-                        target_wxid = None  # 修改变量名保持一致
-                        
-                        if contacts:
-                            # 获取每个联系人的详细信息
-                            for wxid in contacts:
-                                try:
-                                    response = self._get_contact_brief_info([wxid])
-                                    
-                                    if response and response.get('ret') == 200:
-                                        data = response.get('data', [])
-                                        if isinstance(data, list) and len(data) > 0:
-                                            contact_info = data[0]  # 直接取第一个元素
-                                            if contact_info.get('nickName') == user_name:
-                                                target_wxid = wxid
-                                                logger.info(f"[GeweChatTask] 找到目标用户: {user_name} -> {target_wxid}")
-                                                break
-                                except Exception as e:
-                                    logger.error(f"[GeweChatTask] 获取用户详情失败: {e}, 响应内容: {response}")
-                                    continue
-                            
-                            if not target_wxid:  # 修改判断条件
-                                e_context['reply'] = Reply(ReplyType.ERROR, f"未找到用户: {user_name}，请确保昵称完全匹配")
-                                e_context.action = EventAction.BREAK_PASS
-                                return
-                        else:
-                            e_context['reply'] = Reply(ReplyType.ERROR, "获取联系人列表失败，请稍后重试")
-                            e_context.action = EventAction.BREAK_PASS
-                            return
-                        
-                        # 修改上下文信息，添加用户标记
-                        e_context['context']['user_mention'] = target_wxid  # 使用 target_wxid
-                
-                result = self._create_task(time_str, circle_str, event_str, e_context['context'])
-                e_context['reply'] = Reply(ReplyType.TEXT, result)
-                e_context.action = EventAction.BREAK_PASS
-                return
-            
-            # 命令格式错误
-            e_context['reply'] = Reply(ReplyType.ERROR, "命令格式错误，请查看帮助信息")
+        elif content.startswith(self.command_prefix_second):
+            command = content[len(self.command_prefix_second):].strip()
+        elif content.startswith(self.command_prefix_third):
+            command = content[len(self.command_prefix_third):].strip()
+        else:
+            return
+        
+        # 空命令显示帮助
+        if not command:
+            e_context['reply'] = Reply(ReplyType.TEXT, self.get_help_text())
             e_context.action = EventAction.BREAK_PASS
             return
+        
+        # 插件直接调用机制 - 检查是否是直接的插件调用
+        plugin_match = re.match(r'^p\[([^\]]+)\]', command)
+        if plugin_match:
+            plugin_name = plugin_match.group(1)
+            # 创建一个当前时间的任务
+            now = datetime.now()
+            time_str = now.strftime("%H:%M")
+            circle_str = "今天"
+            
+            # 构建任务内容
+            event_str = command  # 使用完整的命令作为事件内容
+            
+            # 创建并执行任务
+            result = self._create_task(time_str, circle_str, event_str, e_context['context'])
+            e_context['reply'] = Reply(ReplyType.TEXT, result)
+            e_context.action = EventAction.BREAK_PASS
+            return
+            
+        # 1. 先处理特殊命令（任务列表和取消任务）
+        if command.startswith("任务列表"):
+            # 检查是否提供了密码
+            parts = command.split()
+            if len(parts) < 2:
+                e_context['reply'] = Reply(ReplyType.ERROR, "请提供访问密码")
+                e_context.action = EventAction.BREAK_PASS
+                return
+            
+            # 验证密码
+            password = parts[1]
+            config_password = self.plugin_config.get('task_list_password')
+            if not config_password:
+                e_context['reply'] = Reply(ReplyType.ERROR, "管理员未设置访问密码，无法查看任务列表")
+                e_context.action = EventAction.BREAK_PASS
+                return
+            
+            if password != config_password:
+                e_context['reply'] = Reply(ReplyType.ERROR, "访问密码错误")
+                e_context.action = EventAction.BREAK_PASS
+                return
+            
+            # 密码正确，显示任务列表
+            task_list = self._get_task_list()
+            e_context['reply'] = Reply(ReplyType.TEXT, task_list)
+            e_context.action = EventAction.BREAK_PASS
+            return
+            
+        # 取消任务
+        if command.startswith("取消"):
+            # 移除"取消"并清理空格
+            target = command[2:].strip()
+            if not target:
+                e_context['reply'] = Reply(ReplyType.ERROR, "请指定要取消的任务ID、用户、群聊或 all")
+                e_context.action = EventAction.BREAK_PASS
+                return
+
+            result = self._delete_task(target)
+            e_context['reply'] = Reply(ReplyType.TEXT, result)
+            e_context.action = EventAction.BREAK_PASS
+            return
+            
+        # 2. 处理 cron 表达式命令
+        if "cron[" in command:
+            # 使用正则表达式匹配 cron 表达式和事件内容
+            match = re.match(r'cron\[(.*?)\]\s*(.*)', command)
+            if match:
+                cron_exp = match.group(1).strip()
+                event_str = match.group(2).strip()
+                if not event_str:
+                    e_context['reply'] = Reply(ReplyType.ERROR, "请输入事件内容")
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                result = self._create_task("cron", f"cron[{cron_exp}]", event_str, e_context['context'])
+                e_context['reply'] = Reply(ReplyType.TEXT, result)
+                e_context.action = EventAction.BREAK_PASS
+                return
+            else:
+                e_context['reply'] = Reply(ReplyType.ERROR, "cron表达式格式错误，正确格式：$time cron[分 时 日 月 周] 事件内容")
+                e_context.action = EventAction.BREAK_PASS
+                return
+            
+        # 3. 处理普通定时任务
+        parts = command.split(" ", 2)
+        if len(parts) == 3:
+            circle_str, time_str, event_str = parts
+            
+            # 检查是否包含用户标记
+            user_name = None
+            if 'u[' in event_str:
+                match = re.match(r'u\[([^\]]+)\]\s*(.*)', event_str)
+                if match:
+                    user_name = match.group(1)
+                    event_str = match.group(2).strip()
+                    
+                    # 获取联系人列表并查找目标用户
+                    contacts = self._get_contacts()
+                    target_wxid = None  # 修改变量名保持一致
+                    
+                    if contacts:
+                        # 获取每个联系人的详细信息
+                        for wxid in contacts:
+                            try:
+                                response = self._get_contact_brief_info([wxid])
+                                
+                                if response and response.get('ret') == 200:
+                                    data = response.get('data', [])
+                                    if isinstance(data, list) and len(data) > 0:
+                                        contact_info = data[0]  # 直接取第一个元素
+                                        if contact_info.get('nickName') == user_name:
+                                            target_wxid = wxid
+                                            logger.info(f"[GeweChatTask] 找到目标用户: {user_name} -> {target_wxid}")
+                                            break
+                            except Exception as e:
+                                logger.error(f"[GeweChatTask] 获取用户详情失败: {e}, 响应内容: {response}")
+                                continue
+                        
+                        if not target_wxid:  # 修改判断条件
+                            e_context['reply'] = Reply(ReplyType.ERROR, f"未找到用户: {user_name}，请确保昵称完全匹配")
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+                    else:
+                        e_context['reply'] = Reply(ReplyType.ERROR, "获取联系人列表失败，请稍后重试")
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    
+                    # 修改上下文信息，添加用户标记
+                    e_context['context']['user_mention'] = target_wxid  # 使用 target_wxid
+            
+            result = self._create_task(time_str, circle_str, event_str, e_context['context'])
+            e_context['reply'] = Reply(ReplyType.TEXT, result)
+            e_context.action = EventAction.BREAK_PASS
+            return
+            
+        # 命令格式错误
+        e_context['reply'] = Reply(ReplyType.ERROR, "命令格式错误，请查看帮助信息")
+        e_context.action = EventAction.BREAK_PASS
+        return
 
     def _execute_laohuangli_plugin(self, context_info: dict) -> str:
         """老黄历插件
